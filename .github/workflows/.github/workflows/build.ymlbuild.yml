@@ -1,0 +1,236 @@
+name: Build PipePipe Lite (MT6580 30FPS Edition)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Set up Java 17 for Android Build
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 2. Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 3. Clone PipePipe (with all submodules)
+        run: |
+          git clone --recurse-submodules https://github.com/InfinityLoop1308/PipePipe.git pipepipe-src
+
+      - name: 4. Inject 30-FPS Blocker, H.264 Hardware Priority & Low-RAM Tweaks
+        run: |
+          python3 - << 'EOF'
+          import os, re, glob, sys
+
+          root = "pipepipe-src"
+
+          # Locate the main org/schabi/newpipe/util directory (supports both direct & submodule layouts)
+          util_dirs = glob.glob(os.path.join(root, "**/org/schabi/newpipe/util"), recursive=True)
+          if not util_dirs:
+              print("ERROR: Could not locate org/schabi/newpipe/util directory")
+              sys.exit(1)
+          util_dir = util_dirs[0]
+          print(f"Found util directory: {util_dir}")
+
+          # 1. Write PipePipeLiteOptimizer.java
+          optimizer_code = '''package org.schabi.newpipe.util;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.preference.PreferenceManager;
+          import org.schabi.newpipe.extractor.MediaFormat;
+          import org.schabi.newpipe.extractor.stream.VideoStream;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public final class PipePipeLiteOptimizer {
+              public static final int MAX_ALLOWED_FPS = 30;
+              public static final int MAX_SAFE_VERTICAL_RESOLUTION = 720;
+              private static final String PREF_LITE_INITIALIZED = "pipepipe_lite_mt6580_initialized_v1";
+              private static final Pattern HIGH_FPS_LABEL_PATTERN =
+                      Pattern.compile("(?i).*?(?:p|fps\\\\s*)(50|59|60|90|120)\\\\b.*");
+              private static final Pattern VERTICAL_RES_PATTERN =
+                      Pattern.compile("(\\\\d{3,4})p");
+
+              private PipePipeLiteOptimizer() {}
+
+              public static List<VideoStream> filterAndOptimizeStreams(final List<VideoStream> originalStreams) {
+                  if (originalStreams == null || originalStreams.isEmpty()) {
+                      return originalStreams;
+                  }
+                  final List<VideoStream> allowedStreams = new ArrayList<>(originalStreams.size());
+                  VideoStream lowestFallback = null;
+                  int lowestFallbackHeight = Integer.MAX_VALUE;
+
+                  for (final VideoStream stream : originalStreams) {
+                      if (stream == null) continue;
+                      final int height = extractHeight(stream.getResolution());
+                      if (height > 0 && height < lowestFallbackHeight) {
+                          lowestFallbackHeight = height;
+                          lowestFallback = stream;
+                      }
+                      if (isHighFrameRate(stream)) continue;
+                      if (height > MAX_SAFE_VERTICAL_RESOLUTION) continue;
+                      allowedStreams.add(stream);
+                  }
+                  if (allowedStreams.isEmpty() && lowestFallback != null) {
+                      allowedStreams.add(lowestFallback);
+                      return allowedStreams;
+                  }
+                  Collections.sort(allowedStreams, new Comparator<VideoStream>() {
+                      @Override
+                      public int compare(final VideoStream a, final VideoStream b) {
+                          final int h = Integer.compare(extractHeight(b.getResolution()), extractHeight(a.getResolution()));
+                          if (h != 0) return h;
+                          return Integer.compare(getCodecPriority(a), getCodecPriority(b));
+                      }
+                  });
+                  return allowedStreams;
+              }
+
+              public static boolean isHighFrameRate(final VideoStream stream) {
+                  if (stream == null) return false;
+                  try {
+                      if (stream.getFps() > MAX_ALLOWED_FPS) return true;
+                  } catch (final Throwable ignored) {}
+                  final String res = stream.getResolution();
+                  return res != null && HIGH_FPS_LABEL_PATTERN.matcher(res).matches();
+              }
+
+              private static int getCodecPriority(final VideoStream stream) {
+                  final MediaFormat f = stream.getFormat();
+                  if (f == MediaFormat.MPEG_4) return 0;
+                  if (f == MediaFormat.v3GPP) return 1;
+                  return 2;
+              }
+
+              public static int extractHeight(final String resolution) {
+                  if (resolution == null || resolution.isEmpty()) return 0;
+                  final Matcher m = VERTICAL_RES_PATTERN.matcher(resolution.toLowerCase(Locale.ROOT));
+                  if (m.find()) {
+                      try { return Integer.parseInt(m.group(1)); } catch (final NumberFormatException ignored) {}
+                  }
+                  return 0;
+              }
+
+              public static void applyLowEndHardwareDefaults(final Context context) {
+                  if (context == null) return;
+                  final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+                  if (prefs.getBoolean(PREF_LITE_INITIALIZED, false)) return;
+                  prefs.edit()
+                          .putString("default_resolution", "480p")
+                          .putString("default_popup_resolution", "360p")
+                          .putString("limit_mobile_data_usage", "360p")
+                          .putString("default_video_format", "MPEG-4")
+                          .putBoolean("show_higher_resolutions", false)
+                          .putBoolean("sponsor_block_enable", true)
+                          .putBoolean(PREF_LITE_INITIALIZED, true)
+                          .apply();
+              }
+          }
+          '''
+          with open(os.path.join(util_dir, "PipePipeLiteOptimizer.java"), "w") as f:
+              f.write(optimizer_code)
+          print("Successfully wrote PipePipeLiteOptimizer.java")
+
+          # 2. Patch ListHelper.java to filter out >30FPS streams and prioritize H.264
+          list_helper_path = os.path.join(util_dir, "ListHelper.java")
+          if os.path.exists(list_helper_path):
+              with open(list_helper_path, "r") as f:
+                  lh = f.read()
+              # Hook into getSortedStreamVideosList
+              pattern = r"(getSortedStreamVideosList\s*\([^)]*\)\s*\{)"
+              replacement = (
+                  r"\1\n"
+                  r"        videoStreams = PipePipeLiteOptimizer.filterAndOptimizeStreams(videoStreams);\n"
+                  r"        videoOnlyStreams = PipePipeLiteOptimizer.filterAndOptimizeStreams(videoOnlyStreams);"
+              )
+              lh_new, count = re.subn(pattern, replacement, lh, count=1)
+              if count > 0:
+                  with open(list_helper_path, "w") as f:
+                      f.write(lh_new)
+                  print("Patched ListHelper.java with 30-FPS stream filter.")
+
+          # 3. Patch ExoPlayer DefaultTrackSelector to enforce maxVideoFrameRate(30) in adaptive/SABR playback
+          for java_file in glob.glob(os.path.join(root, "**/*.java"), recursive=True):
+              with open(java_file, "r", errors="ignore") as f:
+                  content = f.read()
+              if "buildUponParameters()" in content and "setMaxVideoFrameRate" not in content:
+                  patched = content.replace(
+                      "buildUponParameters()",
+                      "buildUponParameters().setMaxVideoFrameRate(30)"
+                  )
+                  with open(java_file, "w") as f:
+                      f.write(patched)
+                  print(f"Patched ExoPlayer TrackSelector in {java_file} to cap adaptive streams at 30 FPS.")
+
+          # 4. Patch App.java to apply 480p & MPEG-4 hardware defaults on startup
+          app_files = glob.glob(os.path.join(root, "**/org/schabi/newpipe/App.java"), recursive=True)
+          if app_files:
+              with open(app_files[0], "r") as f:
+                  app_src = f.read()
+              app_src = re.sub(
+                  r"(super\.onCreate\(\);)",
+                  r"\1\n        org.schabi.newpipe.util.PipePipeLiteOptimizer.applyLowEndHardwareDefaults(this);",
+                  app_src,
+                  count=1
+              )
+              with open(app_files[0], "w") as f:
+                  f.write(app_src)
+              print("Patched App.java with MT6580 first-boot preferences.")
+
+          # 5. Patch XML default preferences directly as well
+          for xml_file in glob.glob(os.path.join(root, "**/res/values/*.xml"), recursive=True):
+              with open(xml_file, "r", errors="ignore") as f:
+                  xml = f.read()
+              modified = False
+              if 'name="default_resolution_value"' in xml:
+                  xml = re.sub(
+                      r'(<string[^>]*name="default_resolution_value"[^>]*>)[^<]*(</string>)',
+                      r'\g<1>480p\g<2>',
+                      xml
+                  )
+                  modified = True
+              if modified:
+                  with open(xml_file, "w") as f:
+                      f.write(xml)
+                  print(f"Updated default resolution in {xml_file}")
+          EOF
+
+      - name: 5. Build Signed ARMv7 (armeabi-v7a) APK
+        run: |
+          # Find the directory containing gradlew
+          GRADLE_DIR=$(dirname $(find pipepipe-src -name "gradlew" | head -n 1))
+          cd "$GRADLE_DIR"
+          chmod +x gradlew
+
+          # Create a persistent release keystore so the APK installs cleanly on Android 8.1
+          keytool -genkey -v -keystore pipepipe-lite.keystore \
+            -alias pipepipelite -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass pipepipe123 -keypass pipepipe123 \
+            -dname "CN=PipePipeLite, OU=LowEnd, O=PipePipe, L=Local, S=Local, C=US"
+
+          # Build release APK filtered for armeabi-v7a
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$(pwd)/pipepipe-lite.keystore" \
+            -Pandroid.injected.signing.store.password=pipepipe123 \
+            -Pandroid.injected.signing.key.alias=pipepipelite \
+            -Pandroid.injected.signing.key.password=pipepipe123 \
+            -PreactNativeArchitectures=armeabi-v7a \
+            --no-daemon
+
+      - name: 6. Upload Finished PipePipe Lite APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PipePipe-Lite-armeabi-v7a-APK
+          path: |
+            pipepipe-src/**/*.apk
